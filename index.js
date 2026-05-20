@@ -240,59 +240,35 @@ function schedulePochiRelayToManager(incidentId, managerUserId) {
   }
 
   setTimeout(async () => {
-    const relayFiredAt = new Date();
-
     try {
-      let payload;
+      // 【テスト用】時間制限でアラートにならないよう、確実に3時間枠（18:00〜21:00）を固定セット
+      const targetStart = '18:00';
+      const targetEnd = '21:00';
 
-      if (!incidentId) {
-        console.warn('incidentId がないため、デモ用の固定時間でポチ案内を送ります。');
-        const demoEnd = new Date(relayFiredAt);
-        demoEnd.setHours(22, 0, 0, 0);
-        payload = buildTimeeAutoPushMessage(
-          relayFiredAt.toISOString(),
-          demoEnd.toISOString(),
-          relayFiredAt
-        );
-      } else {
-        const incident = await fetchIncidentShiftTimes(incidentId);
-        if (!incident?.shift_start_time || !incident?.shift_end_time) {
-          await client.pushMessage({
-            to: pushTo,
-            messages: [
-              {
-                type: 'text',
-                text: '【パチポチ】欠勤インシデントのシフト情報が見つかりません。管理者に連絡してください。'
-              }
-            ]
-          });
-          return;
-        }
-
-        payload = buildTimeeAutoPushMessage(
-          incident.shift_start_time,
-          incident.shift_end_time,
-          relayFiredAt
-        );
-
-        if (payload.ok) {
-          const calc = calculateTimeeRecruitment(
-            incident.shift_start_time,
-            incident.shift_end_time,
-            relayFiredAt
-          );
-          console.log('✅ タイミー募集時間を算出:', {
-            incidentId,
-            targetStart: payload.targetStart,
-            targetEnd: payload.targetEnd,
-            remainingMinutes: Math.floor(calc.remainingMs / 60000)
-          });
-        }
+      if (incidentId) {
+        console.log(`✅ ポチ案内送信（テスト固定時間） incidentId: ${incidentId}`);
       }
 
       await client.pushMessage({
         to: pushTo,
-        messages: [payload.message]
+        messages: [
+          {
+            type: 'text',
+            text: `【パチポチテスト：身内全滅】\n身内スタッフの応募がありませんでした。\n\nテスト用に確実に動く時間をセットしました。\n\n⏰ 募集条件：本日 ${targetStart} 〜 ${targetEnd}\n\n以下のボタンを「ポチっ」と押せば、システムがタイミーへログインし、自動入力を開始します！`,
+            quickReply: {
+              items: [
+                {
+                  type: 'action',
+                  action: {
+                    type: 'postback',
+                    label: '🚀 タイミーへ自動求人発行（ポチ）',
+                    data: `action=timee_auto&start=${targetStart}&end=${targetEnd}`
+                  }
+                }
+              ]
+            }
+          }
+        ]
       });
       console.log('✅ 店長へタイミー自動発行ボタン（ポチ）を送信しました');
     } catch (err) {
