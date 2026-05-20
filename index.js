@@ -1,6 +1,7 @@
 import express from 'express';
 import { messagingApi } from '@line/bot-sdk';
 import { createClient } from '@supabase/supabase-js';
+import puppeteer from 'puppeteer';
 import 'dotenv/config';
 
 const app = express();
@@ -40,13 +41,11 @@ function parsePostbackData(data) {
   }
 }
 
-/** 15分単位で切り上げ */
 function roundUpTo15Minutes(date) {
   const step = 15 * 60 * 1000;
   return new Date(Math.ceil(date.getTime() / step) * step);
 }
 
-/** JST で HH:mm 表示 */
 function formatTimeJST(date) {
   return new Intl.DateTimeFormat('ja-JP', {
     timeZone: 'Asia/Tokyo',
@@ -56,7 +55,6 @@ function formatTimeJST(date) {
   }).format(date);
 }
 
-/** 募集時間の表示用（例：（3時間）、（1時間30分）） */
 function formatDurationLabel(durationMs) {
   const totalMinutes = Math.floor(durationMs / (60 * 1000));
   const hours = Math.floor(totalMinutes / 60);
@@ -66,17 +64,9 @@ function formatDurationLabel(durationMs) {
   return `（${minutes}分）`;
 }
 
-/**
- * タイミー募集開始・終了を自動計算（最短1時間〜）
- * @param {string} shiftStartTime ISO
- * @param {string} shiftEndTime ISO
- * @param {Date} relayFiredAt setTimeout 発火時刻
- */
 function calculateTimeeRecruitment(shiftStartTime, shiftEndTime, relayFiredAt = new Date()) {
   const originalStart = new Date(shiftStartTime);
   const originalEnd = new Date(shiftEndTime);
-
-  // テストでは3秒後に発火するが、計算上は「30分経過後」の時刻として扱う
   const assumedNow = new Date(
     relayFiredAt.getTime() + BROADCAST_WAIT_MS - POCHI_RELAY_DELAY_MS
   );
@@ -101,33 +91,59 @@ function calculateTimeeRecruitment(shiftStartTime, shiftEndTime, relayFiredAt = 
   };
 }
 
-function buildTimeeGuidanceMessage(shiftStartTime, shiftEndTime, relayFiredAt) {
+/** ポチ用プッシュメッセージ（計算済み時間 + 自動発行ボタン） */
+function buildTimeeAutoPushMessage(shiftStartTime, shiftEndTime, relayFiredAt) {
   const calc = calculateTimeeRecruitment(shiftStartTime, shiftEndTime, relayFiredAt);
 
   if (!calc.ok) {
-    return `【パチポチ通知：身内全滅】
+    return {
+      ok: false,
+      message: {
+        type: 'text',
+        text: `【パチポチ通知：身内全滅】
 店長、一斉送信から30分経ちましたが身内スタッフの応募がありませんでした。
 
 店長、残り時間が1時間未満のため、本日のタイミー募集は見合わせるか、終了時間を後ろに延ばして再設定してください！
 
 📋 参考：本来のシフト ${formatTimeJST(new Date(shiftStartTime))} 〜 ${formatTimeJST(new Date(shiftEndTime))}
-📋 算出した募集開始候補：${formatTimeJST(calc.recruitStart)}`;
+📋 算出した募集開始候補：${formatTimeJST(calc.recruitStart)}`
+      }
+    };
   }
 
-  const startLabel = formatTimeJST(calc.recruitStart);
-  const endLabel = formatTimeJST(calc.recruitEnd);
+  const targetStart = formatTimeJST(calc.recruitStart);
+  const targetEnd = formatTimeJST(calc.recruitEnd);
   const durationLabel = formatDurationLabel(calc.remainingMs);
 
-  return `【パチポチ通知：身内全滅】
-店長、一斉送信から30分経ちましたが身内スタッフの応募がありませんでした。
+  return {
+    ok: true,
+    targetStart,
+    targetEnd,
+    message: {
+      type: 'text',
+      text: `【パチポチ通知：身内全滅】
+身内スタッフの応募がありませんでした。
 
-現場を維持するため、タイミー（Timee）での募集に切り替えます。システムが最短1時間ルールに沿って募集時間を自動計算しました。
+タイミーの掲載基準（最短1時間〜）に合わせ、本日の募集時間を自動算出しました。
 
-⏰ 募集条件：本日 ${startLabel} 〜 ${endLabel}${durationLabel}
+⏰ 募集条件：本日 ${targetStart} 〜 ${targetEnd}${durationLabel}
 📋 コピペ用業務内容：${TIMEE_JOB_DESCRIPTION}
 
-以下のリンクを「ポチっ」と押して、この条件で求人を発行してください！
-👉 タイミー求人作成画面を開く`;
+以下のボタンを「ポチっ」と押せば、店長の代わりにシステムがタイミーへログインし、この条件で求人を即座に自動発行します！`,
+      quickReply: {
+        items: [
+          {
+            type: 'action',
+            action: {
+              type: 'postback',
+              label: '🚀 タイミーへ自動求人発行（ポチ）',
+              data: `action=timee_auto&start=${encodeURIComponent(targetStart)}&end=${encodeURIComponent(targetEnd)}`
+            }
+          }
+        ]
+      }
+    }
+  };
 }
 
 async function fetchIncidentShiftTimes(incidentId) {
@@ -144,8 +160,63 @@ async function fetchIncidentShiftTimes(incidentId) {
   return data;
 }
 
-/** パチ → ポチへの自動リレー（一斉送信開始 + タイミー誘導スケジュール） */
-async function runPachiBroadcastFlow(replyToken, incidentId) {
+/** タイミーの画面を裏で自動操縦して求人を入れる */
+async function autoCreateTimeeJob(startTimeStr, endTimeStr) {
+  console.log(`🤖 タイミーの自動操縦を開始します... (${startTimeStr} 〜 ${endTimeStr})`);
+
+  const email = process.env.TIMEE_USER_EMAIL;
+  const password = process.env.TIMEE_USER_PASSWORD;
+  if (!email || !password) {
+    console.error('❌ TIMEE_USER_EMAIL / TIMEE_USER_PASSWORD が未設定です');
+    return false;
+  }
+
+  const browser = await puppeteer.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto('https://worker.timee.co.jp/business/login', { waitUntil: 'networkidle0' });
+
+    await page.type('input[type="email"]', email);
+    await page.type('input[type="password"]', password);
+    await page.click('button[type="submit"]');
+    await page.waitForNavigation({ waitUntil: 'networkidle0' });
+
+    console.log('🔑 タイミーへの自動ログインに成功しました。求人作成に入ります。');
+
+    await page.goto('https://worker.timee.co.jp/business/jobs/new', { waitUntil: 'networkidle0' });
+
+    await page.waitForSelector('.template-select-button', { timeout: 5000 });
+    await page.click('.template-select-button');
+
+    await page.focus('#job-start-time');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('A');
+    await page.keyboard.up('Control');
+    await page.keyboard.press('Backspace');
+    await page.type('#job-start-time', startTimeStr);
+
+    await page.focus('#job-end-time');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('A');
+    await page.keyboard.up('Control');
+    await page.keyboard.press('Backspace');
+    await page.type('#job-end-time', endTimeStr);
+
+    await page.click('.submit-job-button');
+    await new Promise((r) => setTimeout(r, 2000));
+
+    console.log('🚀 タイミーへの自動求人発行が完了しました！');
+    await browser.close();
+    return true;
+  } catch (err) {
+    console.error('❌ タイミーの自動操縦中にエラー発生:', err.message);
+    await browser.close();
+    return false;
+  }
+}
+
+async function runPachiBroadcastFlow(replyToken, incidentId, managerUserId) {
   console.log('身内スタッフ全員へLINEマルチキャスト配信を実行しました（擬似）');
 
   await client.replyMessage({
@@ -153,27 +224,18 @@ async function runPachiBroadcastFlow(replyToken, incidentId) {
     messages: [
       {
         type: 'text',
-        text: '【パチポチ】身内スタッフへ一斉送信を開始しました。応募がない場合、まもなくタイミー募集の案内をお送りします。'
+        text: '📡 身内スタッフ全員へLINE一斉要請を配信しました。回答を30分間待ちます。'
       }
     ]
   });
 
-  schedulePochiRelayToManager(incidentId);
+  schedulePochiRelayToManager(incidentId, managerUserId);
 }
 
-async function getFirstStoreId() {
-  const { data, error } = await supabase.from('stores').select('id').limit(1);
-  if (error || !data || data.length === 0) return null;
-  return data[0].id;
-}
-
-/**
- * パチ完了後、ポチ（タイミー誘導）を店長へ push（incidents のシフト時刻から募集枠を算出）
- */
-function schedulePochiRelayToManager(incidentId) {
-  const adminId = process.env.ADMIN_LINE_USER_ID;
-  if (!adminId) {
-    console.warn('ADMIN_LINE_USER_ID が未設定のため、タイミー誘導メッセージを送信しません。');
+function schedulePochiRelayToManager(incidentId, managerUserId) {
+  const pushTo = managerUserId || process.env.ADMIN_LINE_USER_ID;
+  if (!pushTo) {
+    console.warn('店長の LINE userId が未設定のため、タイミー誘導を送信しません。');
     return;
   }
 
@@ -181,21 +243,22 @@ function schedulePochiRelayToManager(incidentId) {
     const relayFiredAt = new Date();
 
     try {
-      let messageText;
+      let payload;
 
       if (!incidentId) {
-        console.warn('incidentId がないため、タイミー時間を固定文面で送信します。');
-        messageText = buildTimeeGuidanceMessage(
+        console.warn('incidentId がないため、デモ用の固定時間でポチ案内を送ります。');
+        const demoEnd = new Date(relayFiredAt);
+        demoEnd.setHours(22, 0, 0, 0);
+        payload = buildTimeeAutoPushMessage(
           relayFiredAt.toISOString(),
-          new Date(relayFiredAt.getTime() + 3 * TIMEE_MIN_RECRUITMENT_MS).toISOString(),
+          demoEnd.toISOString(),
           relayFiredAt
         );
       } else {
         const incident = await fetchIncidentShiftTimes(incidentId);
         if (!incident?.shift_start_time || !incident?.shift_end_time) {
-          console.error('❌ シフト時刻を取得できませんでした incidentId:', incidentId);
           await client.pushMessage({
-            to: adminId,
+            to: pushTo,
             messages: [
               {
                 type: 'text',
@@ -206,36 +269,42 @@ function schedulePochiRelayToManager(incidentId) {
           return;
         }
 
-        messageText = buildTimeeGuidanceMessage(
+        payload = buildTimeeAutoPushMessage(
           incident.shift_start_time,
           incident.shift_end_time,
           relayFiredAt
         );
 
-        const calc = calculateTimeeRecruitment(
-          incident.shift_start_time,
-          incident.shift_end_time,
-          relayFiredAt
-        );
-        console.log('✅ タイミー募集時間を算出:', {
-          incidentId,
-          assumedNow: calc.assumedNow.toISOString(),
-          recruitStart: calc.recruitStart.toISOString(),
-          recruitEnd: calc.recruitEnd.toISOString(),
-          remainingMinutes: Math.floor(calc.remainingMs / 60000),
-          ok: calc.ok
-        });
+        if (payload.ok) {
+          const calc = calculateTimeeRecruitment(
+            incident.shift_start_time,
+            incident.shift_end_time,
+            relayFiredAt
+          );
+          console.log('✅ タイミー募集時間を算出:', {
+            incidentId,
+            targetStart: payload.targetStart,
+            targetEnd: payload.targetEnd,
+            remainingMinutes: Math.floor(calc.remainingMs / 60000)
+          });
+        }
       }
 
       await client.pushMessage({
-        to: adminId,
-        messages: [{ type: 'text', text: messageText }]
+        to: pushTo,
+        messages: [payload.message]
       });
-      console.log('✅ 店長へタイミー誘導メッセージ（ポチ）を送信しました');
+      console.log('✅ 店長へタイミー自動発行ボタン（ポチ）を送信しました');
     } catch (err) {
       console.error('❌ タイミー誘導メッセージの送信エラー:', err?.message || err);
     }
   }, POCHI_RELAY_DELAY_MS);
+}
+
+async function getFirstStoreId() {
+  const { data, error } = await supabase.from('stores').select('id').limit(1);
+  if (error || !data || data.length === 0) return null;
+  return data[0].id;
 }
 
 app.post('/webhook', express.json(), async (req, res) => {
@@ -245,21 +314,55 @@ app.post('/webhook', express.json(), async (req, res) => {
   for (const event of events) {
     if (event.type === 'postback') {
       const replyToken = event.replyToken;
-      const { action, incidentId } = parsePostbackData(event.postback?.data || '');
+      const userId = event.source?.userId;
+      const { action, incidentId, start, end } = parsePostbackData(event.postback?.data || '');
 
       if (action === 'broadcast') {
-        await runPachiBroadcastFlow(replyToken, incidentId || null);
+        await runPachiBroadcastFlow(replyToken, incidentId || null, userId);
+        continue;
       }
+
+      if (action === 'timee_auto') {
+        const startTime = start ? decodeURIComponent(start) : '';
+        const endTime = end ? decodeURIComponent(end) : '';
+
+        await client.replyMessage({
+          replyToken,
+          messages: [
+            {
+              type: 'text',
+              text: '🤖 了解です！システムが今からタイミーの管理画面に潜入し、自動入力を開始します。30秒ほどお待ちください...'
+            }
+          ]
+        });
+
+        const success = await autoCreateTimeeJob(startTime, endTime);
+        const notifyTo = userId || process.env.ADMIN_LINE_USER_ID;
+
+        if (notifyTo) {
+          await client.pushMessage({
+            to: notifyTo,
+            messages: [
+              {
+                type: 'text',
+                text: success
+                  ? `✨【自動化成功】\nタイミーへの求人発行が完全に完了しました！（${startTime} 〜 ${endTime}）\nワーカーの応募が入るまでそのままお待ちください。`
+                  : '❌【自動化エラー】\nタイミーのログインまたは入力に失敗しました。お手数ですが手動でログインしてご確認ください。'
+              }
+            ]
+          });
+        }
+        continue;
+      }
+
       continue;
     }
 
     if (event.type === 'message' && event.message.type === 'text') {
-      const rawMessage = event.message.text;
-      const userMessage = sanitizeLineText(rawMessage);
+      const userMessage = sanitizeLineText(event.message.text);
       const replyToken = event.replyToken;
       const userId = event.source.userId;
 
-      // 1. スタッフ登録の処理
       if (userMessage.startsWith('登録：') || userMessage.startsWith('登録:')) {
         const staffName = userMessage.replace('登録：', '').replace('登録:', '').trim();
         const storeId = await getFirstStoreId();
@@ -291,7 +394,6 @@ app.post('/webhook', express.json(), async (req, res) => {
           messages: [{ type: 'text', text: `🎉 ${staffName}さんのスタッフ登録が完了しました！` }]
         });
       } else if (userMessage.includes('欠勤')) {
-        // 【核心】欠勤申請の検知（1タップ目：パチ）
         const storeId = await getFirstStoreId();
 
         if (!storeId) {
@@ -318,9 +420,9 @@ app.post('/webhook', express.json(), async (req, res) => {
 
         if (staffId) {
           const now = new Date();
-          // シフトの終了時間を「本日の22:00」にピタッと合わせる
           const shiftEnd = new Date();
           shiftEnd.setHours(22, 0, 0, 0);
+
           const { data: incidentRows, error: incidentErr } = await supabase
             .from('incidents')
             .insert([
@@ -342,10 +444,7 @@ app.post('/webhook', express.json(), async (req, res) => {
           }
         }
 
-        const postbackData = new URLSearchParams({
-          action: 'broadcast',
-          staffName
-        });
+        const postbackData = new URLSearchParams({ action: 'broadcast', staffName });
         if (incidentId) postbackData.set('incidentId', incidentId);
 
         await client.replyMessage({
@@ -377,9 +476,10 @@ app.post('/webhook', express.json(), async (req, res) => {
       }
     }
   }
+
   res.status(200).send('OK');
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 パチポチコアサーバーが http://localhost:${PORT} で起動中...`);
+  console.log(`🚀 タイミー自動操縦サーバーが http://localhost:${PORT} で起動中...`);
 });
