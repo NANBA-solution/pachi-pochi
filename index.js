@@ -6,9 +6,6 @@ import 'dotenv/config';
 const app = express();
 const PORT = 3000;
 
-/** 店長がクイックリプライで送る一斉送信開始アクション（パチ → ポチの入口） */
-const BROADCAST_ACTION_TEXT = 'アクション：身内へ一斉送信を開始する';
-
 /** 身内応募待ち（本番30分 / テスト3秒）後にタイミー誘導を送るまでの遅延 */
 const POCHI_RELAY_DELAY_MS = 3 * 1000;
 
@@ -36,6 +33,31 @@ const client = new MessagingApiClient({
 function sanitizeLineText(raw) {
   if (typeof raw !== 'string') return '';
   return raw.replace(/\r/g, '').replace(/\n/g, '').trim();
+}
+
+function parsePostbackData(data) {
+  try {
+    return Object.fromEntries(new URLSearchParams(data).entries());
+  } catch {
+    return {};
+  }
+}
+
+/** パチ → ポチへの自動リレー（一斉送信開始 + タイミー誘導スケジュール） */
+async function runPachiBroadcastFlow(replyToken) {
+  console.log('身内スタッフ全員へLINEマルチキャスト配信を実行しました（擬似）');
+
+  await client.replyMessage({
+    replyToken,
+    messages: [
+      {
+        type: 'text',
+        text: '【パチポチ】身内スタッフへ一斉送信を開始しました。応募がない場合、まもなくタイミー募集の案内をお送りします。'
+      }
+    ]
+  });
+
+  schedulePochiRelayToManager();
 }
 
 async function getFirstStoreId() {
@@ -72,6 +94,16 @@ app.post('/webhook', express.json(), async (req, res) => {
   if (!events || events.length === 0) return res.status(200).send('OK');
 
   for (const event of events) {
+    if (event.type === 'postback') {
+      const replyToken = event.replyToken;
+      const { action } = parsePostbackData(event.postback?.data || '');
+
+      if (action === 'broadcast') {
+        await runPachiBroadcastFlow(replyToken);
+      }
+      continue;
+    }
+
     if (event.type === 'message' && event.message.type === 'text') {
       const rawMessage = event.message.text;
       const userMessage = sanitizeLineText(rawMessage);
@@ -155,7 +187,7 @@ app.post('/webhook', express.json(), async (req, res) => {
           }
         }
 
-        // 無料プランでも確実に動く「ボタン付き店長通知（Flex Message風クイックリプライ）」を送信
+        // postback のみ（手動テキスト送信なし）のクイックリプライボタン
         await client.replyMessage({
           replyToken,
           messages: [
@@ -167,9 +199,9 @@ app.post('/webhook', express.json(), async (req, res) => {
                   {
                     type: 'action',
                     action: {
-                      type: 'message',
+                      type: 'postback',
                       label: '👉 身内へ一斉送信する（パチ）',
-                      text: BROADCAST_ACTION_TEXT
+                      data: `action=broadcast&staffName=${encodeURIComponent(staffName)}`
                     }
                   }
                 ]
@@ -177,21 +209,6 @@ app.post('/webhook', express.json(), async (req, res) => {
             }
           ]
         });
-      } else if (userMessage === BROADCAST_ACTION_TEXT) {
-        // 【核心】パチ → ポチへの自動リレー（2タップ目：ポチ待ち → タイミー誘導）
-        console.log('身内スタッフ全員へLINEマルチキャスト配信を実行しました（擬似）');
-
-        await client.replyMessage({
-          replyToken,
-          messages: [
-            {
-              type: 'text',
-              text: '【パチポチ】身内スタッフへ一斉送信を開始しました。応募がない場合、まもなくタイミー募集の案内をお送りします。'
-            }
-          ]
-        });
-
-        schedulePochiRelayToManager();
       } else {
         // 通常のオウム返し
         await client.replyMessage({
