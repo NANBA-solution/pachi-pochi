@@ -6,6 +6,23 @@ import 'dotenv/config';
 const app = express();
 const PORT = 3000;
 
+/** 店長がクイックリプライで送る一斉送信開始アクション（パチ → ポチの入口） */
+const BROADCAST_ACTION_TEXT = 'アクション：身内へ一斉送信を開始する';
+
+/** 身内応募待ち（本番30分 / テスト3秒）後にタイミー誘導を送るまでの遅延 */
+const POCHI_RELAY_DELAY_MS = 3 * 1000;
+
+const TIMEE_GUIDANCE_MESSAGE = `【パチポチ通知：身内全滅】
+店長、一斉送信から30分経ちましたが身内スタッフの応募がありませんでした。
+
+現場を維持するため、タイミー（Timee）での募集に切り替えます。システムが最低3時間ルールをクリアする時間を自動計算しました。
+
+⏰ 募集条件：本日 18:00 〜 21:00（3時間）
+📋 コピペ用業務内容：「ホールの補助・洗い場・接客」
+
+以下のリンクを「ポチっ」と押して、この条件で求人を発行してください！
+👉 タイミー求人作成画面を開く`;
+
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -25,6 +42,29 @@ async function getFirstStoreId() {
   const { data, error } = await supabase.from('stores').select('id').limit(1);
   if (error || !data || data.length === 0) return null;
   return data[0].id;
+}
+
+/**
+ * パチ完了後、ポチ（タイミー誘導）を店長へ push する（テスト時は数秒遅延）
+ */
+function schedulePochiRelayToManager() {
+  const adminId = process.env.ADMIN_LINE_USER_ID;
+  if (!adminId) {
+    console.warn('ADMIN_LINE_USER_ID が未設定のため、タイミー誘導メッセージを送信しません。');
+    return;
+  }
+
+  setTimeout(async () => {
+    try {
+      await client.pushMessage({
+        to: adminId,
+        messages: [{ type: 'text', text: TIMEE_GUIDANCE_MESSAGE }]
+      });
+      console.log('✅ 店長へタイミー誘導メッセージ（ポチ）を送信しました');
+    } catch (err) {
+      console.error('❌ タイミー誘導メッセージの送信エラー:', err?.message || err);
+    }
+  }, POCHI_RELAY_DELAY_MS);
 }
 
 app.post('/webhook', express.json(), async (req, res) => {
@@ -129,7 +169,7 @@ app.post('/webhook', express.json(), async (req, res) => {
                     action: {
                       type: 'message',
                       label: '👉 身内へ一斉送信する（パチ）',
-                      text: 'アクション：身内へ一斉送信を開始する'
+                      text: BROADCAST_ACTION_TEXT
                     }
                   }
                 ]
@@ -137,6 +177,21 @@ app.post('/webhook', express.json(), async (req, res) => {
             }
           ]
         });
+      } else if (userMessage === BROADCAST_ACTION_TEXT) {
+        // 【核心】パチ → ポチへの自動リレー（2タップ目：ポチ待ち → タイミー誘導）
+        console.log('身内スタッフ全員へLINEマルチキャスト配信を実行しました（擬似）');
+
+        await client.replyMessage({
+          replyToken,
+          messages: [
+            {
+              type: 'text',
+              text: '【パチポチ】身内スタッフへ一斉送信を開始しました。応募がない場合、まもなくタイミー募集の案内をお送りします。'
+            }
+          ]
+        });
+
+        schedulePochiRelayToManager();
       } else {
         // 通常のオウム返し
         await client.replyMessage({
