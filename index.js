@@ -175,7 +175,7 @@ async function autoCreateTimeeJob(startTimeStr, endTimeStr) {
   const page = await browser.newPage();
 
   try {
-    await page.goto('https://login.timee.co.jp/business/login', { waitUntil: 'networkidle0' });
+    await page.goto('https://business.timee.co.jp/login', { waitUntil: 'networkidle0' });
 
     await page.type('input[type="email"]', email);
     await page.type('input[type="password"]', password);
