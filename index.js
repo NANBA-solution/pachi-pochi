@@ -51,47 +51,6 @@ function parseRegistrationCommand(userMessage) {
   return { ok: true, staffName };
 }
 
-function buildAbsenceAdminFlex(staffName, incidentId) {
-  const bodyText =
-    `【パチポチ通知】${staffName}さんから欠勤申請が届きました。本日シフト外の身内スタッフへ一斉送信（穴埋め要請）を行いますか？`;
-  return {
-    type: 'flex',
-    altText: `【パチポチ】${staffName}さんから欠勤申請`,
-    contents: {
-      type: 'bubble',
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        contents: [
-          {
-            type: 'text',
-            text: bodyText,
-            wrap: true,
-            size: 'sm'
-          }
-        ]
-      },
-      footer: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'sm',
-        contents: [
-          {
-            type: 'button',
-            style: 'primary',
-            height: 'sm',
-            action: {
-              type: 'postback',
-              label: '一斉送信を開始する',
-              data: `action=start_broadcast&incident_id=${incidentId}`
-            }
-          }
-        ]
-      }
-    }
-  };
-}
-
 /** postback data を query 形式として解釈する */
 function parsePostbackData(data) {
   try {
@@ -270,7 +229,15 @@ app.post('/webhook', express.json(), async (req, res) => {
         const adminId = process.env.ADMIN_LINE_USER_ID;
         if (adminId) {
           try {
-            await client.pushMessage(adminId, [buildAbsenceAdminFlex(staffName, String(incidentId))]);
+            await client.pushMessage({
+              to: process.env.ADMIN_LINE_USER_ID,
+              messages: [
+                {
+                  type: 'text',
+                  text: `【パチポチ通知】\n${staffName}さんから欠勤申請が届きました。\n\n本日シフト外の身内スタッフへ一斉送信（穴埋め要請）を行いますか？\n\n「一斉送信を開始する」と送信してください。`
+                }
+              ]
+            });
           } catch (pushErr) {
             console.error('❌ 店長へのプッシュ送信エラー:', pushErr?.message || pushErr);
           }
