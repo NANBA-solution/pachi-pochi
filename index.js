@@ -318,7 +318,9 @@ app.post('/webhook', express.json(), async (req, res) => {
 
         if (staffId) {
           const now = new Date();
-          const shiftEnd = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+          // シフトの終了時間を「本日の22:00」にピタッと合わせる
+          const shiftEnd = new Date();
+          shiftEnd.setHours(22, 0, 0, 0);
           const { data: incidentRows, error: incidentErr } = await supabase
             .from('incidents')
             .insert([
