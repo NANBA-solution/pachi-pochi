@@ -175,7 +175,7 @@ async function autoCreateTimeeJob(startTimeStr, endTimeStr) {
   const page = await browser.newPage();
 
   try {
-    await page.goto('https://worker.timee.co.jp/business/login', { waitUntil: 'networkidle0' });
+    await page.goto('https://client.timee.co.jp/business/login', { waitUntil: 'networkidle0' });
 
     await page.type('input[type="email"]', email);
     await page.type('input[type="password"]', password);
@@ -184,7 +184,7 @@ async function autoCreateTimeeJob(startTimeStr, endTimeStr) {
 
     console.log('🔑 タイミーへの自動ログインに成功しました。求人作成に入ります。');
 
-    await page.goto('https://worker.timee.co.jp/business/jobs/new', { waitUntil: 'networkidle0' });
+    await page.goto('https://client.timee.co.jp/business/jobs/new', { waitUntil: 'networkidle0' });
 
     await page.waitForSelector('.template-select-button', { timeout: 5000 });
     await page.click('.template-select-button');
