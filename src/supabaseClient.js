@@ -7,4 +7,4 @@ if (!supabaseUrl || !supabaseAnonKey) {
   console.error('⚠️ Supabaseの環境変数が設定されていません。 .env.local を確認してください。');
 }
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase = createClient(supabaseUrl ?? '', supabaseAnonKey ?? '');
